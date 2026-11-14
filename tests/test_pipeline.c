@@ -3528,6 +3528,196 @@ TEST(pipeline_cross_file_method_defines_method_venue_parity) {
     PASS();
 }
 
+/* ── JS property-assigned functions in the graph ─────────────────────────────
+ * The CommonJS/Express shape `authUtil.authenticate = function…`: the function
+ * must become its own node, and the CALLS edges out of its body must start at
+ * that node — not at the file's Module node, which is where they all landed
+ * before. Extraction-level coverage lives in test_extraction.c
+ * (extract_js_member_assign_*); this checks the edges that reach the store. */
+static const char MEMBER_ASSIGN_UTIL_JS[] = "const authUtil = {};\n"
+                                            "function verifyToken(req) { return !!req; }\n"
+                                            "authUtil.authenticate = function (req, res, next) {\n"
+                                            "  if (!verifyToken(req)) { return null; }\n"
+                                            "  return next();\n"
+                                            "};\n"
+                                            "authUtil.audit = async (req) => {\n"
+                                            "  return verifyToken(req);\n"
+                                            "};\n"
+                                            "module.exports = authUtil;\n";
+
+/* The routes file that uses it, Express-shaped: middleware first, then
+ * the real handler wrapped in `errorHandler(...)`, or written inline. The
+ * HANDLES edge must reach the wrapped controller function, and never the
+ * `authenticate` middleware, which became resolvable once it was named. */
+static const char MEMBER_ASSIGN_ROUTES_JS[] =
+    "const express = require('express');\n"
+    "const router = express.Router();\n"
+    "const authUtil = require('./route_util');\n"
+    "const itemController = {};\n"
+    "itemController.list = async function (req, res) { res.json([]); };\n"
+    "function errorHandler(fn) { return fn; }\n"
+    "router.get('/items', authUtil.authenticate, errorHandler(itemController.list));\n"
+    "router.post('/items/new', authUtil.authenticate, async (req, res) => {\n"
+    "  res.json({});\n"
+    "});\n"
+    "module.exports = router;\n";
+
+/* Edges of `edge_type` leaving any node named `source_name`. */
+static int edges_from_name(cbm_store_t *s, const char *project, const char *edge_type,
+                           const char *source_name) {
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    if (cbm_store_find_edges_by_type(s, project, edge_type, &edges, &edge_count) != CBM_STORE_OK) {
+        return -1;
+    }
+    int matches = 0;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t source = {0};
+        if (cbm_store_find_node_by_id(s, edges[i].source_id, &source) == CBM_STORE_OK &&
+            source.name && strcmp(source.name, source_name) == 0) {
+            matches++;
+        }
+        cbm_node_free_fields(&source);
+    }
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
+    return matches;
+}
+
+/* CALLS edges into `target_name` whose source node carries `source_label`. */
+static int calls_into_from_label(cbm_store_t *s, const char *project, const char *target_name,
+                                 const char *source_label) {
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    if (cbm_store_find_edges_by_type(s, project, "CALLS", &edges, &edge_count) != CBM_STORE_OK) {
+        return -1;
+    }
+    int matches = 0;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t source = {0};
+        cbm_node_t target = {0};
+        int source_ok = cbm_store_find_node_by_id(s, edges[i].source_id, &source) == CBM_STORE_OK;
+        int target_ok = cbm_store_find_node_by_id(s, edges[i].target_id, &target) == CBM_STORE_OK;
+        if (source_ok && target_ok && source.label && target.name &&
+            strcmp(source.label, source_label) == 0 && strcmp(target.name, target_name) == 0) {
+            matches++;
+        }
+        cbm_node_free_fields(&source);
+        cbm_node_free_fields(&target);
+    }
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
+    return matches;
+}
+
+typedef struct {
+    int run_rc;
+    bool store_opened;
+    int authenticate_nodes; /* Function nodes named "authenticate" */
+    int audit_nodes;        /* Function nodes named "audit" */
+    int from_authenticate;  /* CALLS authenticate → verifyToken */
+    int from_audit;         /* CALLS audit → verifyToken */
+    int from_module;        /* CALLS <Module> → verifyToken */
+    int list_handles;       /* HANDLES itemController.list → /items */
+    int auth_handles;       /* HANDLES authenticate → any route */
+    char authenticate_qn[256];
+} MemberAssignObservation;
+
+static MemberAssignObservation run_member_assign_case(bool parallel) {
+    MemberAssignObservation o = {.run_rc = -1,
+                                 .authenticate_nodes = -1,
+                                 .audit_nodes = -1,
+                                 .from_authenticate = -1,
+                                 .from_audit = -1,
+                                 .from_module = -1,
+                                 .list_handles = -1,
+                                 .auth_handles = -1};
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_member_assign_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return o;
+    }
+    char path[512];
+    snprintf(path, sizeof(path), "%s/route_util.js", tmp);
+    char routes_path[512];
+    snprintf(routes_path, sizeof(routes_path), "%s/items.js", tmp);
+    if (th_write_file(path, MEMBER_ASSIGN_UTIL_JS) == 0 &&
+        th_write_file(routes_path, MEMBER_ASSIGN_ROUTES_JS) == 0) {
+        XlangEnvSave save = xlang_env_select(parallel);
+        char db_path[512];
+        snprintf(db_path, sizeof(db_path), "%s/member_assign.db", tmp);
+        cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+        if (pipeline) {
+            o.run_rc = cbm_pipeline_run(pipeline);
+            const char *project = cbm_pipeline_project_name(pipeline);
+            cbm_store_t *store = cbm_store_open_path(db_path);
+            o.store_opened = store != NULL;
+            if (store && project) {
+                o.authenticate_nodes = named_node_count(store, project, "authenticate");
+                o.audit_nodes = named_node_count(store, project, "audit");
+                o.from_authenticate =
+                    named_edge_count(store, project, "CALLS", "authenticate", "verifyToken");
+                o.from_audit = named_edge_count(store, project, "CALLS", "audit", "verifyToken");
+                o.from_module = calls_into_from_label(store, project, "verifyToken", "Module");
+                o.list_handles = named_edge_count(store, project, "HANDLES", "list", "/items");
+                o.auth_handles = edges_from_name(store, project, "HANDLES", "authenticate");
+                cbm_node_t *nodes = NULL;
+                int count = 0;
+                if (cbm_store_find_nodes_by_name(store, project, "authenticate", &nodes, &count) ==
+                        CBM_STORE_OK &&
+                    count > 0 && nodes[0].qualified_name) {
+                    snprintf(o.authenticate_qn, sizeof(o.authenticate_qn), "%s",
+                             nodes[0].qualified_name);
+                }
+                if (nodes) {
+                    cbm_store_free_nodes(nodes, count);
+                }
+            }
+            if (store) {
+                cbm_store_close(store);
+            }
+            cbm_pipeline_free(pipeline);
+        }
+        xlang_env_restore(&save);
+    }
+    th_rmtree(tmp);
+    return o;
+}
+
+static int check_member_assign(const MemberAssignObservation *o) {
+    ASSERT_EQ(o->run_rc, 0);
+    ASSERT_TRUE(o->store_opened);
+    ASSERT_EQ(o->authenticate_nodes, 1);
+    ASSERT_EQ(o->audit_nodes, 1);
+    /* The owning object is part of the node's identity. */
+    ASSERT_NOT_NULL(strstr(o->authenticate_qn, ".route_util.authUtil.authenticate"));
+    ASSERT_EQ(o->from_authenticate, 1);
+    ASSERT_EQ(o->from_audit, 1);
+    ASSERT_EQ(o->from_module, 0);
+    /* The wrapped handler owns the route; the middleware owns none. */
+    ASSERT_EQ(o->list_handles, 1);
+    ASSERT_EQ(o->auth_handles, 0);
+    return 0;
+}
+
+TEST(pipeline_js_member_assign_calls_source_function_sequential) {
+    MemberAssignObservation o = run_member_assign_case(false);
+    if (check_member_assign(&o) != 0) {
+        return 1;
+    }
+    PASS();
+}
+
+TEST(pipeline_js_member_assign_calls_source_function_parallel) {
+    MemberAssignObservation o = run_member_assign_case(true);
+    if (check_member_assign(&o) != 0) {
+        return 1;
+    }
+    PASS();
+}
+
 static bool test_buffer_appendf(char *buffer, size_t capacity, size_t *used, const char *format,
                                 ...) {
     if (!buffer || !used || *used >= capacity) {
@@ -35073,6 +35263,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_js_route_not_bound_to_python_builtin_sequential);
     RUN_TEST(pipeline_js_route_not_bound_to_python_builtin_parallel);
     RUN_TEST(pipeline_js_route_not_bound_to_python_builtin_incremental);
+    RUN_TEST(pipeline_js_member_assign_calls_source_function_sequential);
+    RUN_TEST(pipeline_js_member_assign_calls_source_function_parallel);
     RUN_TEST(pipeline_cross_file_method_defines_method_sequential);
     RUN_TEST(pipeline_cross_file_method_defines_method_venue_parity);
     RUN_TEST(pipeline_objectscript_export_aggregate_exceeds_arena_block_table);

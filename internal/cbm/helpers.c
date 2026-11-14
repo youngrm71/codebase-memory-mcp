@@ -1497,6 +1497,222 @@ bool cbm_elixir_def_head_is(TSNode signature, TSNode node) {
     }
 }
 
+/* Deepest member chain accepted as an owning-object path (`a.b.c.….fn`). A bound,
+ * not a tuning knob: it only keeps the recursion finite on generated code. */
+enum { JS_MEMBER_PATH_MAX_DEPTH = 16 };
+
+/* The static `.property` of a JS/TS member_expression: a plain property_identifier
+ * reached with `.` (no `?.`). Null for `#private`, optional chains and anything
+ * else, which have no stable dotted spelling. */
+static TSNode js_member_static_property(TSNode member) {
+    TSNode null_node = {0};
+    if (ts_node_is_null(member) || strcmp(ts_node_type(member), "member_expression") != 0) {
+        return null_node;
+    }
+    if (!ts_node_is_null(ts_node_child_by_field_name(member, TS_FIELD("optional_chain")))) {
+        return null_node;
+    }
+    TSNode prop = ts_node_child_by_field_name(member, TS_FIELD("property"));
+    if (ts_node_is_null(prop) || strcmp(ts_node_type(prop), "property_identifier") != 0) {
+        return null_node;
+    }
+    return prop;
+}
+
+/* The dotted spelling of a static owning-object path — an identifier or a chain of
+ * member_expressions over identifiers (`authUtil`, `module.exports`, `a.b.c`) —
+ * rebuilt segment by segment so whitespace or comments inside the chain never
+ * leak into a QN. NULL for `this`, calls, subscripts, `?.` and the like. With a
+ * NULL arena it only answers "is this path static" (non-NULL sentinel = yes).
+ * Iterative: the chain is walked down to its base identifier, collecting each
+ * `.property`, then spelled back out from the base. */
+static const char *js_static_object_path(CBMArena *a, TSNode node, const char *source) {
+    TSNode props[JS_MEMBER_PATH_MAX_DEPTH];
+    int count = 0;
+    while (!ts_node_is_null(node) && strcmp(ts_node_type(node), "identifier") != 0) {
+        if (count == JS_MEMBER_PATH_MAX_DEPTH) {
+            return NULL;
+        }
+        TSNode prop = js_member_static_property(node);
+        if (ts_node_is_null(prop)) {
+            return NULL;
+        }
+        props[count++] = prop;
+        node = ts_node_child_by_field_name(node, TS_FIELD("object"));
+    }
+    if (ts_node_is_null(node)) {
+        return NULL;
+    }
+    if (!a) {
+        return ts_node_type(node);
+    }
+    const char *path = cbm_node_text(a, node, source);
+    while (path && count > 0) {
+        count--;
+        char *prop_text = cbm_node_text(a, props[count], source);
+        if (!prop_text || !prop_text[0]) {
+            return NULL;
+        }
+        path = cbm_arena_sprintf(a, "%s.%s", path, prop_text);
+    }
+    return path;
+}
+
+TSNode cbm_js_member_assign_name_node(TSNode func_node) {
+    TSNode null_node = {0};
+    if (ts_node_is_null(func_node)) {
+        return null_node;
+    }
+    const char *kind = ts_node_type(func_node);
+    if (strcmp(kind, "function_expression") != 0 && strcmp(kind, "arrow_function") != 0) {
+        return null_node;
+    }
+    TSNode parent = ts_node_parent(func_node);
+    if (ts_node_is_null(parent) || strcmp(ts_node_type(parent), "assignment_expression") != 0) {
+        return null_node;
+    }
+    /* Only the assigned value is named — never a function that merely appears on
+     * the left (`fn().x = …` puts no function on the right of this assignment). */
+    TSNode right = ts_node_child_by_field_name(parent, TS_FIELD("right"));
+    if (!ts_node_eq(right, func_node)) {
+        return null_node;
+    }
+    /* A named function expression (`x.y = function doThing() {}`) already has its
+     * own name and identity; the property only names anonymous functions. */
+    if (!ts_node_is_null(ts_node_child_by_field_name(func_node, TS_FIELD("name")))) {
+        return null_node;
+    }
+    TSNode left = ts_node_child_by_field_name(parent, TS_FIELD("left"));
+    TSNode prop = js_member_static_property(left);
+    if (ts_node_is_null(prop)) {
+        return null_node;
+    }
+    if (!js_static_object_path(NULL, ts_node_child_by_field_name(left, TS_FIELD("object")), NULL)) {
+        return null_node;
+    }
+    return prop;
+}
+
+/* True when `node`'s source text is exactly `text`. */
+static bool js_node_text_is(TSNode node, const char *source, const char *text) {
+    if (ts_node_is_null(node) || !source) {
+        return false;
+    }
+    uint32_t start = ts_node_start_byte(node);
+    uint32_t end = ts_node_end_byte(node);
+    size_t len = strlen(text);
+    return end - start == len && memcmp(source + start, text, len) == 0;
+}
+
+/* `module.exports` as an assignment target: the module's default export. */
+static bool js_is_module_exports(TSNode left, const char *source) {
+    return ts_node_type(left) && strcmp(ts_node_type(left), "member_expression") == 0 &&
+           js_node_text_is(ts_node_child_by_field_name(left, TS_FIELD("object")), source,
+                           "module") &&
+           js_node_text_is(ts_node_child_by_field_name(left, TS_FIELD("property")), source,
+                           "exports");
+}
+
+/* Function-expression kinds that may be anonymous; declarations and methods
+ * always carry a name. */
+static bool js_is_function_expression_kind(const char *kind) {
+    return strcmp(kind, "function_expression") == 0 || strcmp(kind, "function") == 0 ||
+           strcmp(kind, "generator_function") == 0 || strcmp(kind, "arrow_function") == 0;
+}
+
+static bool js_is_named_function_kind(const char *kind) {
+    return strcmp(kind, "function_declaration") == 0 ||
+           strcmp(kind, "generator_function_declaration") == 0 ||
+           strcmp(kind, "method_definition") == 0;
+}
+
+/* Whether a function expression has no identity of its own, so the calls in its
+ * body already fall through to whatever encloses it: a callback argument, an
+ * IIFE, a returned function, `module.exports = function…`, `this.x = function…`.
+ * Deliberately conservative — anything that could carry a name (its own `name`,
+ * a declarator, an object or class property, a static member assignment) counts
+ * as named, so an error only ever leaves an inner function unnamed. A member
+ * assignment counts as named without asking whether it was itself named: if it
+ * was not, a named function encloses it, and the answer is the same. */
+static bool js_function_is_anonymous(TSNode fn, const char *source) {
+    if (!ts_node_is_null(ts_node_child_by_field_name(fn, TS_FIELD("name")))) {
+        return false;
+    }
+    TSNode parent = ts_node_parent(fn);
+    if (ts_node_is_null(parent)) {
+        return true;
+    }
+    const char *pk = ts_node_type(parent);
+    if (strcmp(pk, "variable_declarator") == 0 || strcmp(pk, "pair") == 0 ||
+        strcmp(pk, "public_field_definition") == 0 || strcmp(pk, "field_definition") == 0) {
+        return false;
+    }
+    if (strcmp(pk, "assignment_expression") == 0 &&
+        !ts_node_is_null(cbm_js_member_assign_name_node(fn))) {
+        return js_is_module_exports(ts_node_child_by_field_name(parent, TS_FIELD("left")), source);
+    }
+    return true;
+}
+
+/* Whether a named function encloses `node`. Calls inside closures stay with the
+ * enclosing named function (#2293), so a property-assigned function inside one is
+ * left unnamed and its calls stay where they were. Iterative walk to the root. */
+static bool js_inside_named_function(TSNode node, const char *source) {
+    for (TSNode p = ts_node_parent(node); !ts_node_is_null(p); p = ts_node_parent(p)) {
+        const char *kind = ts_node_type(p);
+        if (js_is_named_function_kind(kind)) {
+            return true;
+        }
+        if (js_is_function_expression_kind(kind) && !js_function_is_anonymous(p, source)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+const char *cbm_js_member_assign_qn_name(CBMArena *a, TSNode func_node, const char *source,
+                                         const char *name) {
+    if (!name) {
+        return NULL;
+    }
+    TSNode prop = cbm_js_member_assign_name_node(func_node);
+    if (ts_node_is_null(prop)) {
+        return name;
+    }
+    /* Inside a named function the calls in this body belong to that function
+     * (#2293): NULL makes both callers skip the def and the function scope, the
+     * same way `module.exports = function…` is handled below. */
+    if (js_inside_named_function(func_node, source)) {
+        return NULL;
+    }
+    /* prop's parent is the LHS member_expression cbm_js_member_assign_name_node
+     * validated; its object is the static owning path. */
+    TSNode left = ts_node_parent(prop);
+    const char *path =
+        js_static_object_path(a, ts_node_child_by_field_name(left, TS_FIELD("object")), source);
+    if (!path) {
+        return name;
+    }
+    /* `module.exports = function…` is the module's default export, not a property
+     * called "exports". NULL tells both callers to treat it as before — no def,
+     * no function scope — so its calls stay module-scoped and CommonJS require()
+     * resolution is untouched (#871). `module.exports.foo = …` is a real property
+     * (path "module.exports") and is named normally. */
+    if (strcmp(path, "module") == 0 && strcmp(name, "exports") == 0) {
+        return NULL;
+    }
+    return cbm_arena_sprintf(a, "%s.%s", path, name);
+}
+
+const char *cbm_lang_member_assign_qn_name(CBMLanguage lang, CBMArena *a, TSNode func_node,
+                                           const char *source, const char *name) {
+    if (lang != CBM_LANG_JAVASCRIPT && lang != CBM_LANG_TYPESCRIPT && lang != CBM_LANG_TSX) {
+        return name;
+    }
+    const char *qn_name = cbm_js_member_assign_qn_name(a, func_node, source, name);
+    return (qn_name && qn_name[0]) ? qn_name : NULL;
+}
+
 static const char *func_node_name(CBMArena *a, TSNode func_node, const char *source,
                                   CBMLanguage lang) {
     // Wolfram: set_delayed_top/set_top/set_delayed/set — LHS is apply(user_symbol("f"), ...)

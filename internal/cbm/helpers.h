@@ -177,6 +177,32 @@ bool cbm_elixir_is_when_guard(TSNode node);
 TSNode cbm_elixir_def_head_unwrap_guard(TSNode first_arg);
 bool cbm_elixir_def_head_is(TSNode signature, TSNode node);
 
+// JavaScript/TypeScript property-assigned functions: `obj.prop = function…`,
+// `a.b.fn = async () => …`. When func_node (a function_expression or
+// arrow_function) is the right-hand side of an assignment whose left-hand side is
+// a member_expression over a static dotted path of identifiers, returns the
+// `property` node (the function's name). Returns a null node otherwise — computed
+// members, `this.x`, calls, subscripts and optional chains stay unnamed.
+TSNode cbm_js_member_assign_name_node(TSNode func_node);
+
+// The QN-relative name of a property-assigned JS/TS function: its owning object
+// path joined to `name`, so `authUtil.authenticate = function…` yields
+// "authUtil.authenticate". Returns `name` unchanged for any other function. Returns
+// NULL — no def, no function scope — for `module.exports = function…` and for a
+// property-assigned function inside a named function, whose calls stay with that
+// function (#2293). Like cbm_nix_qn_name it is shared by the def extractor and the
+// call-scope extractor, so a def QN and the QN its in-body calls are sourced from
+// cannot disagree.
+const char *cbm_js_member_assign_qn_name(CBMArena *a, TSNode func_node, const char *source,
+                                         const char *name);
+
+// Language-dispatching form used by both QN sites (extract_func_def and
+// compute_func_qn): for JS/TS/TSX it is cbm_js_member_assign_qn_name, with an
+// empty result folded into NULL; for every other language it returns `name`
+// unchanged. NULL means "no def / no function scope" (`module.exports = function…`).
+const char *cbm_lang_member_assign_qn_name(CBMLanguage lang, CBMArena *a, TSNode func_node,
+                                           const char *source, const char *name);
+
 // Resolve a function/method definition node's NAME node across all ~130 grammars
 // (generic `name` field, arrow→declarator, C/C++ declarator chain, plus the many
 // per-language quirks: Fortran subroutine, SCSS mixin, SQL create_function, R,

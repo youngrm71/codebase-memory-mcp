@@ -713,6 +713,20 @@ static TSNode find_cpp_template_inner_node(TSNode node, CBMLanguage lang) {
 // Try arrow_function name via parent variable_declarator (top-level resolution)
 // or object-literal property (`pair` key) — the latter covers factory functions
 // that return an object of arrow methods (the Zustand actions-slice pattern, #341).
+/* JS/TS property-assigned functions (`authUtil.authenticate = function…`,
+ * `svc.pay = async () => …`): the property is the name. Without it the function
+ * has no name node, so it is never a def and push_boundary_scopes pushes no
+ * SCOPE_FUNC — every call in its body is sourced to the Module. The owning object
+ * path is composed into the QN by cbm_lang_member_assign_qn_name on both the def
+ * and call-scope sides. Null node for any other language or shape. */
+static TSNode resolve_js_member_assign_name(TSNode node, CBMLanguage lang) {
+    if (lang != CBM_LANG_JAVASCRIPT && lang != CBM_LANG_TYPESCRIPT && lang != CBM_LANG_TSX) {
+        TSNode none = {0};
+        return none;
+    }
+    return cbm_js_member_assign_name_node(node);
+}
+
 static TSNode resolve_toplevel_arrow_name(TSNode node, const char *kind) {
     if (strcmp(kind, "arrow_function") != 0) {
         TSNode null_node = {0};
@@ -1283,6 +1297,12 @@ TSNode cbm_resolve_func_name(TSNode node, CBMLanguage lang) {
             }
         }
 
+        {
+            TSNode r = resolve_js_member_assign_name(node, lang);
+            if (!ts_node_is_null(r)) {
+                return r;
+            }
+        }
         {
             TSNode r = resolve_toplevel_arrow_name(node, kind);
             if (!ts_node_is_null(r)) {
@@ -7073,6 +7093,14 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     const char *qn_name = name;
     if (ctx->language == CBM_LANG_NIX) {
         qn_name = cbm_nix_qn_name(a, node, ctx->source, name);
+    }
+    /* JS/TS: `authUtil.authenticate = function…` → "authUtil.authenticate", so two
+     * objects' same-named properties stay distinct nodes. Must match the
+     * call-scope side (compute_func_qn in extract_unified.c). Other languages
+     * pass through unchanged. */
+    qn_name = cbm_lang_member_assign_qn_name(ctx->language, a, node, ctx->source, qn_name);
+    if (!qn_name) {
+        return; /* `module.exports = function…`: a default export, not a def */
     }
     /* Java/Go derive the module from the containing directory (package), so the
      * filename stem is NOT baked into the QN (Go func in myapp/db/conn.go ->

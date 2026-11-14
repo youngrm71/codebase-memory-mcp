@@ -1347,6 +1347,14 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
             return NULL;
         }
     }
+    /* JS/TS: same owning-object composition as the def extractor (extract_func_def),
+     * so an in-body call sources to "…authUtil.authenticate", the QN the def was
+     * minted under, rather than a bare "…authenticate" no node carries. Other
+     * languages pass through unchanged. */
+    qn_name = cbm_lang_member_assign_qn_name(ctx->language, ctx->arena, node, ctx->source, qn_name);
+    if (!qn_name) {
+        return NULL;
+    }
 
     const char *outer_qn =
         ctx->language == CBM_LANG_PYTHON ? py_nearest_scope_qn(state) : state->enclosing_class_qn;

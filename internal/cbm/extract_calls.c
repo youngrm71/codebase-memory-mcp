@@ -3467,7 +3467,84 @@ static const char *php_class_route_handler(CBMExtractCtx *ctx, TSNode arg) {
     return php_is_identifier(method) ? cbm_arena_sprintf(ctx->arena, "%s::%s", cls, method) : NULL;
 }
 
+enum { JS_HANDLER_WRAP_MAX_DEPTH = 2 };
+
+/* The last argument of a JS/TS call that is not a comment or an options
+ * object; a null node when there is none past the route path. */
+static TSNode js_last_handler_candidate(TSNode args) {
+    TSNode none = {0};
+    uint32_t nc = ts_node_named_child_count(args);
+    for (uint32_t i = nc; i > HANDLER_START_IDX; i--) {
+        TSNode arg = ts_node_named_child(args, i - SKIP_ONE);
+        const char *k = ts_node_type(arg);
+        if (strcmp(k, "comment") == 0 || strcmp(k, "object") == 0) {
+            continue;
+        }
+        return arg;
+    }
+    return none;
+}
+
+/* A JS/TS handler reference: `listUsers`, `ctrl.listUsers`, or the same
+ * wrapped in a call, `errorHandler(ctrl.listUsers)` / `asyncHandler(fn)`.
+ * NULL for an inline function or anything else. */
+/* The last non-comment argument of a wrapper call, or a null node when the call
+ * has none (or is a tagged template: wrapper`...`). */
+static TSNode js_wrapped_handler_arg(TSNode call) {
+    TSNode none = {0};
+    TSNode inner_args = ts_node_child_by_field_name(call, TS_FIELD("arguments"));
+    if (ts_node_is_null(inner_args) || strcmp(ts_node_type(inner_args), "arguments") != 0) {
+        return none;
+    }
+    uint32_t nc = ts_node_named_child_count(inner_args);
+    for (uint32_t i = nc; i > 0; i--) {
+        TSNode inner = ts_node_named_child(inner_args, i - SKIP_ONE);
+        if (strcmp(ts_node_type(inner), "comment") != 0) {
+            return inner;
+        }
+    }
+    return none;
+}
+
+/* Unwraps up to JS_HANDLER_WRAP_MAX_DEPTH wrapper calls (`wrap(ctrl.fn)`,
+ * `outer(inner(ctrl.fn))`) iteratively and returns the reference inside. */
+static const char *js_handler_ref(CBMExtractCtx *ctx, TSNode arg) {
+    for (int depth = 0; !ts_node_is_null(arg); depth++) {
+        const char *k = ts_node_type(arg);
+        if (strcmp(k, "identifier") == 0 || strcmp(k, "member_expression") == 0) {
+            return cbm_node_text(ctx->arena, arg, ctx->source);
+        }
+        if (strcmp(k, "call_expression") != 0 || depth >= JS_HANDLER_WRAP_MAX_DEPTH) {
+            return NULL;
+        }
+        arg = js_wrapped_handler_arg(arg);
+    }
+    return NULL;
+}
+
+/* JS/TS: the handler is the final argument, never an earlier one. Express
+ * apps commonly wrap it (`errorHandler(ctrl.fn)`) or write it inline; the
+ * generic last-match scan below skipped both and fell back to the last named
+ * middleware, so HANDLES pointed at `authenticate`-style middleware. A final
+ * argument that is not a reference yields no handler rather than a wrong one. */
+static const char *js_extract_handler_arg(CBMExtractCtx *ctx, TSNode args) {
+    TSNode last = js_last_handler_candidate(args);
+    if (ts_node_is_null(last)) {
+        return NULL;
+    }
+    if (is_string_like(ts_node_type(last))) {
+        const char *h =
+            normalize_string_handler(ctx->arena, cbm_node_text(ctx->arena, last, ctx->source));
+        return (h && h[0]) ? h : NULL;
+    }
+    return js_handler_ref(ctx, last);
+}
+
 static const char *extract_handler_arg(CBMExtractCtx *ctx, TSNode args) {
+    if (ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
+        ctx->language == CBM_LANG_TSX) {
+        return js_extract_handler_arg(ctx, args);
+    }
     /* The LAST eligible argument wins, and every argument is examined.
      * Express, Fastify, gin and Laravel all put middleware between the route
      * path and the handler, so the first function-shaped argument is usually a

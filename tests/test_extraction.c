@@ -244,6 +244,252 @@ TEST(extract_ts_factory_object_methods_issue341) {
     PASS();
 }
 
+/* --- JS/TS: functions assigned to object properties ---------------------------
+ * `authUtil.authenticate = function…` is the dominant CommonJS/Express shape for
+ * middleware, controllers and services. Before this, the RHS function had no name
+ * node: it was never a def, and every call in its body was sourced to the Module.
+ * The property is the name; the owning object path is part of the QN, so the
+ * same property on two objects stays two nodes. */
+
+/* enclosing_func_qn of the first call whose callee is exactly `callee`. */
+static const char *call_scope(CBMFileResult *r, const char *callee) {
+    for (int i = 0; i < r->calls.count; i++) {
+        if (r->calls.items[i].callee_name && strcmp(r->calls.items[i].callee_name, callee) == 0)
+            return r->calls.items[i].enclosing_func_qn;
+    }
+    return NULL;
+}
+
+/* The def with this exact QN, or NULL. */
+static const CBMDefinition *def_by_qn(CBMFileResult *r, const char *qn) {
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].qualified_name && strcmp(r->defs.items[i].qualified_name, qn) == 0)
+            return &r->defs.items[i];
+    }
+    return NULL;
+}
+
+TEST(extract_js_member_assign_function_expression) {
+    CBMFileResult *r = extract("authUtil.authenticate = function (req, res, next) {\n"
+                               "  return verifyToken(req);\n"
+                               "};\n",
+                               CBM_LANG_JAVASCRIPT, "t", "route_util.js");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *d = def_by_qn(r, "t.route_util.authUtil.authenticate");
+    ASSERT_NOT_NULL(d);
+    ASSERT_STR_EQ(d->label, "Function");
+    ASSERT_STR_EQ(d->name, "authenticate");
+    ASSERT_EQ(d->start_line, 1);
+    ASSERT_EQ(d->end_line, 3);
+    /* The in-body call is sourced to the function, not the module. */
+    ASSERT_STR_EQ(call_scope(r, "verifyToken"), "t.route_util.authUtil.authenticate");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_js_member_assign_async_function_expression) {
+    CBMFileResult *r = extract("authController.getUser = async function (req, res) {\n"
+                               "  const user = await loadUser(req.params.id);\n"
+                               "  return res.json(user);\n"
+                               "};\n",
+                               CBM_LANG_JAVASCRIPT, "t", "auth_controller.js");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_NOT_NULL(def_by_qn(r, "t.auth_controller.authController.getUser"));
+    ASSERT_STR_EQ(call_scope(r, "loadUser"), "t.auth_controller.authController.getUser");
+    ASSERT_STR_EQ(call_scope(r, "res.json"), "t.auth_controller.authController.getUser");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_js_member_assign_arrow_functions) {
+    CBMFileResult *r = extract("service.processPayment = async (payment) => {\n"
+                               "  return chargeCard(payment);\n"
+                               "};\n"
+                               "service.refund = (payment) => reverseCharge(payment);\n",
+                               CBM_LANG_JAVASCRIPT, "t", "payment_service.js");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_NOT_NULL(def_by_qn(r, "t.payment_service.service.processPayment"));
+    ASSERT_NOT_NULL(def_by_qn(r, "t.payment_service.service.refund"));
+    ASSERT_STR_EQ(call_scope(r, "chargeCard"), "t.payment_service.service.processPayment");
+    /* Expression-bodied arrow: the body IS the call. */
+    ASSERT_STR_EQ(call_scope(r, "reverseCharge"), "t.payment_service.service.refund");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_js_member_assign_nested) {
+    CBMFileResult *r = extract(
+        /* A deep static owning path. */
+        "module.exports.helpers.format = function (v) { return fmt(v); };\n"
+        /* An assignment inside a named function stays unnamed (#2293). */
+        "function setup(router) {\n"
+        "  router.handle = function (req) { return dispatch(req); };\n"
+        "  prepare();\n"
+        "}\n"
+        /* Chained assignment: the function is the RHS of the inner one only. */
+        "a.first = b.second = function () { return inner(); };\n"
+        /* The same property name on two objects stays two nodes. */
+        "left.run = function () { return goLeft(); };\n"
+        "right.run = function () { return goRight(); };\n",
+        CBM_LANG_JAVASCRIPT, "t", "nested.js");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_NOT_NULL(def_by_qn(r, "t.nested.module.exports.helpers.format"));
+    ASSERT_STR_EQ(call_scope(r, "fmt"), "t.nested.module.exports.helpers.format");
+
+    ASSERT_NOT_NULL(def_by_qn(r, "t.nested.setup"));
+    ASSERT_NULL(def_by_qn(r, "t.nested.router.handle"));
+    /* Calls inside the closure stay with the enclosing named function. */
+    ASSERT_STR_EQ(call_scope(r, "dispatch"), "t.nested.setup");
+    ASSERT_STR_EQ(call_scope(r, "prepare"), "t.nested.setup");
+
+    ASSERT_NOT_NULL(def_by_qn(r, "t.nested.b.second"));
+    ASSERT_NULL(def_by_qn(r, "t.nested.a.first"));
+    ASSERT_STR_EQ(call_scope(r, "inner"), "t.nested.b.second");
+
+    ASSERT_NOT_NULL(def_by_qn(r, "t.nested.left.run"));
+    ASSERT_NOT_NULL(def_by_qn(r, "t.nested.right.run"));
+    ASSERT_STR_EQ(call_scope(r, "goLeft"), "t.nested.left.run");
+    ASSERT_STR_EQ(call_scope(r, "goRight"), "t.nested.right.run");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Calls inside closures stay with the enclosing NAMED function (#2293), so a
+ * property-assigned function is named only where no named function encloses it.
+ * Inside an anonymous wrapper (a CommonJS `module.exports = function (app)`, a
+ * test callback, an IIFE) there is no enclosing name — its calls would land on the
+ * Module — so the function is still named. Inside a function declaration, a const
+ * arrow, a class method or another property-assigned function it is not, and its
+ * calls stay with that function. */
+TEST(extract_js_member_assign_enclosing_named_function) {
+    CBMFileResult *r = extract("module.exports = function (app) {\n"
+                               "  app.helper = function () { return fromWrapper(); };\n"
+                               "};\n"
+                               "describe('svc', () => {\n"
+                               "  svc.stub = () => fromCallback();\n"
+                               "});\n"
+                               "(function () {\n"
+                               "  ns.boot = function () { return fromIife(); };\n"
+                               "})();\n",
+                               CBM_LANG_JAVASCRIPT, "t", "wrappers.js");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_NOT_NULL(def_by_qn(r, "t.wrappers.app.helper"));
+    ASSERT_STR_EQ(call_scope(r, "fromWrapper"), "t.wrappers.app.helper");
+    ASSERT_NOT_NULL(def_by_qn(r, "t.wrappers.svc.stub"));
+    ASSERT_STR_EQ(call_scope(r, "fromCallback"), "t.wrappers.svc.stub");
+    ASSERT_NOT_NULL(def_by_qn(r, "t.wrappers.ns.boot"));
+    ASSERT_STR_EQ(call_scope(r, "fromIife"), "t.wrappers.ns.boot");
+    cbm_free_result(r);
+
+    r = extract("const make = () => {\n"
+                "  svc.pay = async (p) => { return fromArrow(p); };\n"
+                "};\n"
+                "class Registry {\n"
+                "  init() { reg.handle = function () { return fromMethod(); }; }\n"
+                "}\n"
+                "outer.setup = function () {\n"
+                "  inner.run = function () { return fromInner(); };\n"
+                "};\n",
+                CBM_LANG_JAVASCRIPT, "t", "named.js");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_NULL(def_by_qn(r, "t.named.svc.pay"));
+    ASSERT_STR_EQ(call_scope(r, "fromArrow"), "t.named.make");
+    ASSERT_NULL(def_by_qn(r, "t.named.reg.handle"));
+    ASSERT_STR_EQ(call_scope(r, "fromMethod"), "t.named.Registry.init");
+    ASSERT_NOT_NULL(def_by_qn(r, "t.named.outer.setup"));
+    ASSERT_NULL(def_by_qn(r, "t.named.inner.run"));
+    ASSERT_STR_EQ(call_scope(r, "fromInner"), "t.named.outer.setup");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Shapes with no stable dotted spelling stay unnamed, exactly as before: their
+ * calls remain sourced to the module, and no def is invented for them. */
+TEST(extract_js_member_assign_non_static_lhs_unchanged) {
+    CBMFileResult *r = extract("top();\n"
+                               "this.handler = function () { return fromThis(); };\n"
+                               "registry[key] = function () { return fromSubscript(); };\n"
+                               "getObj().prop = function () { return fromCall(); };\n"
+                               "settings.timeout = 5000;\n",
+                               CBM_LANG_JAVASCRIPT, "t", "dyn.js");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const char *module_scope = call_scope(r, "top");
+    ASSERT_NOT_NULL(module_scope);
+    ASSERT_FALSE(has_def(r, "Function", "handler"));
+    ASSERT_FALSE(has_def(r, "Function", "prop"));
+    ASSERT_FALSE(has_def(r, "Function", "timeout"));
+    ASSERT_STR_EQ(call_scope(r, "fromThis"), module_scope);
+    ASSERT_STR_EQ(call_scope(r, "fromSubscript"), module_scope);
+    ASSERT_STR_EQ(call_scope(r, "fromCall"), module_scope);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* CommonJS export shapes keep the identities they had before (#871 depends on
+ * them): a named function expression keeps its own name and QN, and
+ * `module.exports = <anonymous fn>` is the module's default export — not a
+ * function called "exports" — so it stays unnamed and its calls module-scoped.
+ * A real property under it (`module.exports.helper = …`) is named. */
+TEST(extract_js_member_assign_commonjs_exports_unchanged) {
+    CBMFileResult *r = extract("module.exports = async function doThing({ id }) {\n"
+                               "  return lookup(id);\n"
+                               "};\n",
+                               CBM_LANG_JAVASCRIPT, "t", "doThing.js");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_NOT_NULL(def_by_qn(r, "t.doThing.doThing"));
+    ASSERT_NULL(def_by_qn(r, "t.doThing.module.doThing"));
+    ASSERT_STR_EQ(call_scope(r, "lookup"), "t.doThing.doThing");
+    cbm_free_result(r);
+
+    r = extract("top();\n"
+                "module.exports = async (parent, args) => {\n"
+                "  return resolveIt(args);\n"
+                "};\n"
+                "module.exports.helper = function () { return assist(); };\n",
+                CBM_LANG_JAVASCRIPT, "t", "mutation.js");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_FALSE(has_def(r, "Function", "exports"));
+    ASSERT_STR_EQ(call_scope(r, "resolveIt"), call_scope(r, "top"));
+    ASSERT_NOT_NULL(def_by_qn(r, "t.mutation.module.exports.helper"));
+    ASSERT_STR_EQ(call_scope(r, "assist"), "t.mutation.module.exports.helper");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* TypeScript and TSX share the JS grammar shapes and take the same path. */
+TEST(extract_ts_member_assign_functions) {
+    CBMFileResult *r = extract("export const api: any = {};\n"
+                               "api.fetchUser = async (id: string): Promise<void> => {\n"
+                               "  await request(id);\n"
+                               "};\n"
+                               "api.save = function (u: unknown) { return persist(u); };\n",
+                               CBM_LANG_TYPESCRIPT, "t", "api.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_NOT_NULL(def_by_qn(r, "t.api.api.fetchUser"));
+    ASSERT_NOT_NULL(def_by_qn(r, "t.api.api.save"));
+    ASSERT_STR_EQ(call_scope(r, "request"), "t.api.api.fetchUser");
+    ASSERT_STR_EQ(call_scope(r, "persist"), "t.api.api.save");
+    cbm_free_result(r);
+
+    r = extract("handlers.onClick = () => track('click');\n", CBM_LANG_TSX, "t", "view.tsx");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_NOT_NULL(def_by_qn(r, "t.view.handlers.onClick"));
+    ASSERT_STR_EQ(call_scope(r, "track"), "t.view.handlers.onClick");
+    cbm_free_result(r);
+    PASS();
+}
+
 /* #2010, split out of #1997: AST traversal stacks were allocated from
  * result->arena, which the parallel pass holds for every file until the whole
  * result cache is freed, so a one-file scratch structure was retained for the
@@ -8131,6 +8377,93 @@ TEST(extract_ts_route_handler_after_inline_middleware) {
     PASS();
 }
 
+/* Express apps often wrap the handler, `errorHandler(ctrl.fn)`. The wrapper
+ * call matched none of the reference kinds, so the last-match scan fell back
+ * to the last named MIDDLEWARE and HANDLES pointed at `authenticate`. The
+ * wrapped reference is the handler, through comments and nested wrappers. */
+TEST(extract_js_route_handler_wrapped_in_call) {
+    CBMFileResult *r =
+        extract("r.session.post(\"/bank/:bankID/beneficiaries\",\n"
+                "  achValidation.fieldsValidation,\n"
+                "  routeValidate.authenticate,\n"
+                "  routeValidate.checkBankStatus,\n"
+                "  // routeValidate.hasVerifiedOTP,\n"
+                "  errorHandler(achController.addBeneficiaryV2));\n"
+                "router.get(\"/nested\", auth, catchAsync(errorHandler(ctrl.nested)));\n"
+                "router.get(\"/bare\", auth, asyncHandler(listThings));\n",
+                CBM_LANG_JAVASCRIPT, "t", "achV2.js");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMCall *c = find_call_by_callee(r, "r.session.post");
+    ASSERT_NOT_NULL(c);
+    ASSERT_NOT_NULL(c->second_arg_name);
+    ASSERT_STR_EQ(c->second_arg_name, "achController.addBeneficiaryV2");
+    bool saw_nested = false;
+    bool saw_bare = false;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *rc = &r->calls.items[i];
+        if (!rc->first_string_arg || !rc->callee_name ||
+            strcmp(rc->callee_name, "router.get") != 0) {
+            continue;
+        }
+        ASSERT_NOT_NULL(rc->second_arg_name);
+        if (strcmp(rc->first_string_arg, "/nested") == 0) {
+            ASSERT_STR_EQ(rc->second_arg_name, "ctrl.nested");
+            saw_nested = true;
+        } else if (strcmp(rc->first_string_arg, "/bare") == 0) {
+            ASSERT_STR_EQ(rc->second_arg_name, "listThings");
+            saw_bare = true;
+        }
+    }
+    ASSERT_TRUE(saw_nested);
+    ASSERT_TRUE(saw_bare);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* An inline final handler has no name to point at. The route keeps no handler
+ * rather than handing it to the named middleware before it. Same for a final
+ * wrapper whose argument is not a reference (a handler factory). */
+TEST(extract_js_route_inline_final_handler_not_middleware) {
+    CBMFileResult *r = extract("router.post(\"/inline\", authUtil.authenticate,\n"
+                               "  async (req, res) => { res.json({}); });\n"
+                               "router.post(\"/fnexpr\", authUtil.authenticate,\n"
+                               "  function (req, res) { res.json({}); });\n"
+                               "router.post(\"/factory\", authUtil.authenticate,\n"
+                               "  makeHandler(\"orders\"));\n",
+                               CBM_LANG_JAVASCRIPT, "t", "inline.js");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int routes = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *rc = &r->calls.items[i];
+        if (rc->first_string_arg && rc->callee_name &&
+            strcmp(rc->callee_name, "router.post") == 0) {
+            ASSERT_NULL(rc->second_arg_name);
+            routes++;
+        }
+    }
+    ASSERT_EQ(routes, 3);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A trailing options object does not displace the handler before it, and a
+ * TS registration takes the same path. */
+TEST(extract_ts_route_handler_before_options_object) {
+    CBMFileResult *r =
+        extract("router.get(\"/opts\", auth, errorHandler(ctrl.list), { cache: true });\n",
+                CBM_LANG_TYPESCRIPT, "t", "opts.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMCall *c = find_call_by_callee(r, "router.get");
+    ASSERT_NOT_NULL(c);
+    ASSERT_NOT_NULL(c->second_arg_name);
+    ASSERT_STR_EQ(c->second_arg_name, "ctrl.list");
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Issue #1009 (composed builders): a builder whose template inlines an earlier
  * builder's call plus a query string: `return \`${basePath(id)}?${params}\``.
  * The known-substitution is inlined and the query string is truncated, so the
@@ -15738,6 +16071,14 @@ SUITE(extraction) {
     RUN_TEST(extract_r_box_use_imports_issue218);
     RUN_TEST(extract_r_dollar_call_issue219);
     RUN_TEST(extract_ts_factory_object_methods_issue341);
+    RUN_TEST(extract_js_member_assign_function_expression);
+    RUN_TEST(extract_js_member_assign_async_function_expression);
+    RUN_TEST(extract_js_member_assign_arrow_functions);
+    RUN_TEST(extract_js_member_assign_nested);
+    RUN_TEST(extract_js_member_assign_enclosing_named_function);
+    RUN_TEST(extract_js_member_assign_non_static_lhs_unchanged);
+    RUN_TEST(extract_js_member_assign_commonjs_exports_unchanged);
+    RUN_TEST(extract_ts_member_assign_functions);
     RUN_TEST(traversal_stack_not_in_result_arena_issue2010);
     RUN_TEST(extract_c_macro_hidden_call_survives_preprocessed_pass_issue2010);
     RUN_TEST(extract_c_macros_issue375);
@@ -16124,6 +16465,9 @@ SUITE(extraction) {
     RUN_TEST(extract_ts_await_generic_call_issue2210);
     RUN_TEST(extract_ts_route_handler_after_named_middleware);
     RUN_TEST(extract_ts_route_handler_after_inline_middleware);
+    RUN_TEST(extract_js_route_handler_wrapped_in_call);
+    RUN_TEST(extract_js_route_inline_final_handler_not_middleware);
+    RUN_TEST(extract_ts_route_handler_before_options_object);
     RUN_TEST(extract_ts_url_builder_composed_issue1009);
     RUN_TEST(extract_c_url_builder_gated_issue1009);
     RUN_TEST(extract_ts_url_builder_mixed_returns_issue1009);

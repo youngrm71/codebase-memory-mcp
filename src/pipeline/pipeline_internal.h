@@ -1738,7 +1738,16 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
  *      / route.js under app/ or src/app/ exports, carries the route_path its
  *      directories name and HANDLES its Route (extract_nextjs.c). An index
  *      built before has none of these Routes for its unchanged route files,
- *      so it rebuilds once on upgrade.
+ *      so it rebuilds once on upgrade. Released together: a JS/TS anonymous
+ *      function assigned to a static member path (`a.b.fn = function…`,
+ *      `a.fn = async () => …`) where no named function encloses it is a
+ *      Function named after the property, its QN keeps the owning path, and
+ *      the calls in its body are sourced from it rather than the Module
+ *      (inside a named function its calls stay with that function); a JS/TS route takes its handler
+ * from the final argument, unwrapping `wrapper(ref)`, so middleware is never its handler
+ *      (helpers.c, extract_defs.c, extract_unified.c, extract_calls.c). An
+ *      index built before holds none of these Functions for its unchanged
+ *      .js/.ts files.
  * The unresolved-call coverage threshold remains independent. */
 enum { CBM_SEMANTIC_INDEX_VERSION = 13 };
 
