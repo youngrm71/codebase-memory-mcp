@@ -3718,6 +3718,114 @@ TEST(pipeline_js_member_assign_calls_source_function_parallel) {
     PASS();
 }
 
+/* ── JS function expressions bound by const/let/var in the graph (D1) ────────
+ * `let startTenantCron = function () {...}`: one Function node per declaration,
+ * CALLS out of its body start at that node (never the Module), and a route
+ * registered with such a function resolves its HANDLES edge to it. */
+static const char FN_EXPR_SERVICE_JS[] = "function execute() {}\n"
+                                         "function letCall() {}\n"
+                                         "function varCall() {}\n"
+                                         "module.exports = { execute, letCall, varCall };\n";
+
+static const char FN_EXPR_CTRL_JS[] = "const service = require('./service');\n"
+                                      "const express = require('express');\n"
+                                      "const app = express();\n"
+                                      "const constFn = function () {\n"
+                                      "  service.execute();\n"
+                                      "};\n"
+                                      "let letFn = async function () {\n"
+                                      "  await service.letCall();\n"
+                                      "};\n"
+                                      "var varFn = function () {\n"
+                                      "  service.varCall();\n"
+                                      "};\n"
+                                      "app.get('/x', constFn);\n"
+                                      "module.exports = { constFn, letFn, varFn };\n";
+
+typedef struct {
+    int run_rc;
+    bool store_opened;
+    int const_nodes, let_nodes, var_nodes;
+    int from_const, from_let, from_var; /* CALLS fn → callee */
+    int from_module;                    /* CALLS Module → any of the three callees */
+    int const_handles;                  /* HANDLES constFn → /x */
+} FnExprObservation;
+
+static FnExprObservation run_fn_expr_case(bool parallel) {
+    FnExprObservation o = {.run_rc = -1};
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_fn_expr_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return o;
+    }
+    char svc_path[512];
+    snprintf(svc_path, sizeof(svc_path), "%s/service.js", tmp);
+    char ctrl_path[512];
+    snprintf(ctrl_path, sizeof(ctrl_path), "%s/ctrl.js", tmp);
+    if (th_write_file(svc_path, FN_EXPR_SERVICE_JS) == 0 &&
+        th_write_file(ctrl_path, FN_EXPR_CTRL_JS) == 0) {
+        XlangEnvSave save = xlang_env_select(parallel);
+        char db_path[512];
+        snprintf(db_path, sizeof(db_path), "%s/fn_expr.db", tmp);
+        cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+        if (pipeline) {
+            o.run_rc = cbm_pipeline_run(pipeline);
+            const char *project = cbm_pipeline_project_name(pipeline);
+            cbm_store_t *store = cbm_store_open_path(db_path);
+            o.store_opened = store != NULL;
+            if (store && project) {
+                o.const_nodes = named_node_count(store, project, "constFn");
+                o.let_nodes = named_node_count(store, project, "letFn");
+                o.var_nodes = named_node_count(store, project, "varFn");
+                o.from_const = named_edge_count(store, project, "CALLS", "constFn", "execute");
+                o.from_let = named_edge_count(store, project, "CALLS", "letFn", "letCall");
+                o.from_var = named_edge_count(store, project, "CALLS", "varFn", "varCall");
+                o.from_module = calls_into_from_label(store, project, "execute", "Module") +
+                                calls_into_from_label(store, project, "letCall", "Module") +
+                                calls_into_from_label(store, project, "varCall", "Module");
+                o.const_handles = named_edge_count(store, project, "HANDLES", "constFn", "/x");
+            }
+            if (store) {
+                cbm_store_close(store);
+            }
+            cbm_pipeline_free(pipeline);
+        }
+        xlang_env_restore(&save);
+    }
+    th_rmtree(tmp);
+    return o;
+}
+
+static int check_fn_expr(const FnExprObservation *o) {
+    ASSERT_EQ(o->run_rc, 0);
+    ASSERT_TRUE(o->store_opened);
+    ASSERT_EQ(o->const_nodes, 1);
+    ASSERT_EQ(o->let_nodes, 1);
+    ASSERT_EQ(o->var_nodes, 1);
+    ASSERT_EQ(o->from_const, 1);
+    ASSERT_EQ(o->from_let, 1);
+    ASSERT_EQ(o->from_var, 1);
+    ASSERT_EQ(o->from_module, 0);
+    ASSERT_EQ(o->const_handles, 1);
+    return 0;
+}
+
+TEST(pipeline_js_fn_expr_declarators_sequential) {
+    FnExprObservation o = run_fn_expr_case(false);
+    if (check_fn_expr(&o) != 0) {
+        return 1;
+    }
+    PASS();
+}
+
+TEST(pipeline_js_fn_expr_declarators_parallel) {
+    FnExprObservation o = run_fn_expr_case(true);
+    if (check_fn_expr(&o) != 0) {
+        return 1;
+    }
+    PASS();
+}
+
 static bool test_buffer_appendf(char *buffer, size_t capacity, size_t *used, const char *format,
                                 ...) {
     if (!buffer || !used || *used >= capacity) {
@@ -35265,6 +35373,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_js_route_not_bound_to_python_builtin_incremental);
     RUN_TEST(pipeline_js_member_assign_calls_source_function_sequential);
     RUN_TEST(pipeline_js_member_assign_calls_source_function_parallel);
+    RUN_TEST(pipeline_js_fn_expr_declarators_sequential);
+    RUN_TEST(pipeline_js_fn_expr_declarators_parallel);
     RUN_TEST(pipeline_cross_file_method_defines_method_sequential);
     RUN_TEST(pipeline_cross_file_method_defines_method_venue_parity);
     RUN_TEST(pipeline_objectscript_export_aggregate_exceeds_arena_block_table);

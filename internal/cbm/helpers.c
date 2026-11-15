@@ -1742,8 +1742,11 @@ static const char *func_node_name(CBMArena *a, TSNode func_node, const char *sou
         TSNode op = ts_node_child_by_field_name(func_node, TS_FIELD("operator"));
         return ts_node_is_null(op) ? NULL : cbm_func_name_node_text(a, op, source, lang);
     }
-    // Arrow functions: check parent variable_declarator
-    if (strcmp(ts_node_type(func_node), "arrow_function") == 0) {
+    // Arrow functions and anonymous function expressions (D1): the parent
+    // variable_declarator names them
+    if (strcmp(ts_node_type(func_node), "arrow_function") == 0 ||
+        (strcmp(ts_node_type(func_node), "function_expression") == 0 &&
+         (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX))) {
         TSNode parent = ts_node_parent(func_node);
         if (!ts_node_is_null(parent) && strcmp(ts_node_type(parent), "variable_declarator") == 0) {
             TSNode vname = ts_node_child_by_field_name(parent, TS_FIELD("name"));

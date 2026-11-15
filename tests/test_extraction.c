@@ -465,6 +465,240 @@ TEST(extract_js_member_assign_commonjs_exports_unchanged) {
     PASS();
 }
 
+/* --- JS/TS: function expressions bound by const/let/var (D1) -------------------
+ * `let f = function () {}` is the legacy CommonJS idiom. The declarator names the
+ * function, exactly as it already does for an arrow; before this such functions
+ * had no def and every call in their bodies was sourced to the Module. */
+TEST(extract_js_fn_expr_declarators) {
+    CBMFileResult *r =
+        extract("const constFn = function () {\n"
+                "  service.execute();\n"
+                "};\n"
+                "let letFn = function () {\n"
+                "  service.letCall();\n"
+                "};\n"
+                "var varFn = function () {\n"
+                "  service.varCall();\n"
+                "};\n"
+                "const asyncFn = async function () {\n"
+                "  await service.asyncCall();\n"
+                "};\n"
+                "let anonAsync = async function () { return service.anonCall(); };\n",
+                CBM_LANG_JAVASCRIPT, "t", "exprs.js");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *d = def_by_qn(r, "t.exprs.constFn");
+    ASSERT_NOT_NULL(d);
+    ASSERT_STR_EQ(d->label, "Function");
+    ASSERT_STR_EQ(d->name, "constFn");
+    ASSERT_EQ(d->start_line, 1);
+    ASSERT_EQ(d->end_line, 3);
+    ASSERT_EQ(def_by_qn(r, "t.exprs.letFn")->start_line, 4);
+    ASSERT_EQ(def_by_qn(r, "t.exprs.varFn")->start_line, 7);
+    ASSERT_EQ(def_by_qn(r, "t.exprs.asyncFn")->start_line, 10);
+    ASSERT_EQ(def_by_qn(r, "t.exprs.anonAsync")->start_line, 13);
+    /* Each in-body call belongs to its own function, not the module. */
+    ASSERT_STR_EQ(call_scope(r, "service.execute"), "t.exprs.constFn");
+    ASSERT_STR_EQ(call_scope(r, "service.letCall"), "t.exprs.letFn");
+    ASSERT_STR_EQ(call_scope(r, "service.varCall"), "t.exprs.varFn");
+    ASSERT_STR_EQ(call_scope(r, "service.asyncCall"), "t.exprs.asyncFn");
+    ASSERT_STR_EQ(call_scope(r, "service.anonCall"), "t.exprs.anonAsync");
+    /* One def per function: no duplicate nodes for the same QN. */
+    int n = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].label && strcmp(r->defs.items[i].label, "Function") == 0) {
+            n++;
+        }
+    }
+    ASSERT_EQ(n, 5);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Several declarations in one file, and several declarators in one statement,
+ * stay distinct; nested and named expressions keep sensible identities. */
+TEST(extract_js_fn_expr_distinct_nested_named) {
+    CBMFileResult *r = extract("const outer = function () {\n"
+                               "  const nestedFn = function () { return inside(); };\n"
+                               "  return outerCall(nestedFn);\n"
+                               "};\n"
+                               "let a1 = function () { return first(); }, a2 = function () { "
+                               "return second(); };\n"
+                               "const alias = function realName() { return viaName(); };\n"
+                               "const arrow = () => viaArrow();\n"
+                               "function decl() { return viaDecl(); }\n"
+                               "(function () { viaIife(); })();\n",
+                               CBM_LANG_JAVASCRIPT, "t", "mix.js");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_NOT_NULL(def_by_qn(r, "t.mix.outer"));
+    ASSERT_NOT_NULL(def_by_qn(r, "t.mix.nestedFn"));
+    ASSERT_STR_EQ(call_scope(r, "inside"), "t.mix.nestedFn");
+    ASSERT_STR_EQ(call_scope(r, "outerCall"), "t.mix.outer");
+    ASSERT_NOT_NULL(def_by_qn(r, "t.mix.a1"));
+    ASSERT_NOT_NULL(def_by_qn(r, "t.mix.a2"));
+    ASSERT_STR_EQ(call_scope(r, "first"), "t.mix.a1");
+    ASSERT_STR_EQ(call_scope(r, "second"), "t.mix.a2");
+    /* A named expression keeps its own name (unchanged behaviour). */
+    ASSERT_NOT_NULL(def_by_qn(r, "t.mix.realName"));
+    ASSERT_NULL(def_by_qn(r, "t.mix.alias"));
+    ASSERT_STR_EQ(call_scope(r, "viaName"), "t.mix.realName");
+    /* Arrows and declarations are unchanged. */
+    ASSERT_STR_EQ(call_scope(r, "viaArrow"), "t.mix.arrow");
+    ASSERT_STR_EQ(call_scope(r, "viaDecl"), "t.mix.decl");
+    /* An IIFE has no declarator, so it stays anonymous: calls fall to the module. */
+    ASSERT_FALSE(has_def(r, "Function", "viaIife"));
+    ASSERT_NOT_NULL(call_scope(r, "viaIife"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Property-assigned functions and non-declarator function expressions are not
+ * disturbed by the declarator rule. */
+TEST(extract_js_fn_expr_declarator_leaves_other_shapes) {
+    CBMFileResult *r = extract("top();\n"
+                               "const letFn = function () { return mine(); };\n"
+                               "svc.pay = function () { return charge(); };\n"
+                               "const obj = { run: function () { return inObj(); } };\n"
+                               "register(function () { return inCallback(); });\n"
+                               "module.exports = function () { return inExport(); };\n",
+                               CBM_LANG_JAVASCRIPT, "t", "shapes.js");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_STR_EQ(call_scope(r, "mine"), "t.shapes.letFn");
+    ASSERT_NOT_NULL(def_by_qn(r, "t.shapes.svc.pay"));
+    ASSERT_STR_EQ(call_scope(r, "charge"), "t.shapes.svc.pay");
+    const char *module_scope = call_scope(r, "top");
+    ASSERT_NOT_NULL(module_scope);
+    ASSERT_STR_EQ(call_scope(r, "inCallback"), module_scope);
+    ASSERT_STR_EQ(call_scope(r, "inExport"), module_scope);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_ts_fn_expr_declarators) {
+    CBMFileResult *r = extract("const typed: Handler = async function (req: Req): Promise<void> {\n"
+                               "  await svc.run(req);\n"
+                               "};\n",
+                               CBM_LANG_TYPESCRIPT, "t", "typed.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_NOT_NULL(def_by_qn(r, "t.typed.typed"));
+    ASSERT_STR_EQ(call_scope(r, "svc.run"), "t.typed.typed");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A declarator-bound IIFE binds the call's RESULT, not the function: the function
+ * expression's parent is a call_expression (or parenthesized_expression), so it
+ * must stay anonymous and `x` must not become a Function. */
+TEST(extract_js_fn_expr_declarator_iife_not_named) {
+    CBMFileResult *r = extract("const x = function () { return inX(); }();\n"
+                               "var y = (function () { return inY(); })();\n"
+                               "let z = (function () { return inZ(); }());\n"
+                               "const w = async function () { return inW(); }();\n"
+                               "top();\n",
+                               CBM_LANG_JAVASCRIPT, "t", "iife.js");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_FALSE(has_def(r, "Function", "x"));
+    ASSERT_FALSE(has_def(r, "Function", "y"));
+    ASSERT_FALSE(has_def(r, "Function", "z"));
+    ASSERT_FALSE(has_def(r, "Function", "w"));
+    const char *module_scope = call_scope(r, "top");
+    ASSERT_NOT_NULL(module_scope);
+    ASSERT_STR_EQ(call_scope(r, "inX"), module_scope);
+    ASSERT_STR_EQ(call_scope(r, "inY"), module_scope);
+    ASSERT_STR_EQ(call_scope(r, "inZ"), module_scope);
+    ASSERT_STR_EQ(call_scope(r, "inW"), module_scope);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* TSX goes through the same grammar path as TS and JS. */
+TEST(extract_tsx_fn_expr_declarators) {
+    CBMFileResult *r = extract("const Panel = function (props: Props) {\n"
+                               "  return <div>{render(props)}</div>;\n"
+                               "};\n"
+                               "let handler = async function (e: Event): Promise<void> {\n"
+                               "  await svc.run(e);\n"
+                               "};\n"
+                               "export const exported = function () { return viaExported(); };\n"
+                               "const iife = function () { return viaIife(); }();\n",
+                               CBM_LANG_TSX, "t", "comp.tsx");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *d = def_by_qn(r, "t.comp.Panel");
+    ASSERT_NOT_NULL(d);
+    ASSERT_STR_EQ(d->label, "Function");
+    ASSERT_EQ(d->start_line, 1);
+    ASSERT_EQ(d->end_line, 3);
+    ASSERT_STR_EQ(call_scope(r, "render"), "t.comp.Panel");
+    ASSERT_NOT_NULL(def_by_qn(r, "t.comp.handler"));
+    ASSERT_STR_EQ(call_scope(r, "svc.run"), "t.comp.handler");
+    ASSERT_NOT_NULL(def_by_qn(r, "t.comp.exported"));
+    ASSERT_STR_EQ(call_scope(r, "viaExported"), "t.comp.exported");
+    ASSERT_FALSE(has_def(r, "Function", "iife"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Known limitation, pinned (not endorsed): a nested function's QN is not scoped
+ * by its enclosing function, so two same-named nested function expressions in
+ * one file share one QN. This is existing behaviour for arrows and nested
+ * declarations too; D1 only extends it to function expressions. The test
+ * records the current outcome so a future QN redesign changes it knowingly. */
+TEST(extract_js_fn_expr_nested_same_name_qn_collision) {
+    CBMFileResult *r = extract("function o1() { const cb = function () { return first(); }; }\n"
+                               "function o2() { const cb = function () { return second(); }; }\n"
+                               "function p1() { const cbA = () => inA1(); }\n"
+                               "function p2() { const cbA = () => inA2(); }\n",
+                               CBM_LANG_JAVASCRIPT, "t", "nest.js");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int fn_qn = 0;
+    int arrow_qn = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        const char *qn = r->defs.items[i].qualified_name;
+        if (qn && strcmp(qn, "t.nest.cb") == 0) {
+            fn_qn++;
+        }
+        if (qn && strcmp(qn, "t.nest.cbA") == 0) {
+            arrow_qn++;
+        }
+    }
+    /* Both nested forms behave alike: neither QN is scoped by its parent. */
+    ASSERT_EQ(fn_qn, arrow_qn);
+    ASSERT_TRUE(fn_qn >= 1);
+    /* Neither is qualified by its enclosing function. */
+    ASSERT_NULL(def_by_qn(r, "t.nest.o1.cb"));
+    ASSERT_NULL(def_by_qn(r, "t.nest.o2.cb"));
+    /* Each call is sourced to the shared QN, never to the module. */
+    ASSERT_STR_EQ(call_scope(r, "first"), "t.nest.cb");
+    ASSERT_STR_EQ(call_scope(r, "second"), "t.nest.cb");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Other languages with function-expression syntax are unaffected. */
+TEST(extract_fn_expr_declarator_other_languages_unchanged) {
+    CBMFileResult *r = extract("def helper():\n    return real()\n"
+                               "f = lambda: lam()\n",
+                               CBM_LANG_PYTHON, "t", "m.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_NOT_NULL(def_by_qn(r, "t.m.helper"));
+    ASSERT_FALSE(has_def(r, "Function", "f"));
+    cbm_free_result(r);
+
+    r = extract("let\n  double = x: x * 2;\nin { inherit double; }\n", CBM_LANG_NIX, "t",
+                "default.nix");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* TypeScript and TSX share the JS grammar shapes and take the same path. */
 TEST(extract_ts_member_assign_functions) {
     CBMFileResult *r = extract("export const api: any = {};\n"
@@ -16079,6 +16313,14 @@ SUITE(extraction) {
     RUN_TEST(extract_js_member_assign_non_static_lhs_unchanged);
     RUN_TEST(extract_js_member_assign_commonjs_exports_unchanged);
     RUN_TEST(extract_ts_member_assign_functions);
+    RUN_TEST(extract_js_fn_expr_declarators);
+    RUN_TEST(extract_js_fn_expr_distinct_nested_named);
+    RUN_TEST(extract_js_fn_expr_declarator_leaves_other_shapes);
+    RUN_TEST(extract_ts_fn_expr_declarators);
+    RUN_TEST(extract_js_fn_expr_declarator_iife_not_named);
+    RUN_TEST(extract_tsx_fn_expr_declarators);
+    RUN_TEST(extract_js_fn_expr_nested_same_name_qn_collision);
+    RUN_TEST(extract_fn_expr_declarator_other_languages_unchanged);
     RUN_TEST(traversal_stack_not_in_result_arena_issue2010);
     RUN_TEST(extract_c_macro_hidden_call_survives_preprocessed_pass_issue2010);
     RUN_TEST(extract_c_macros_issue375);

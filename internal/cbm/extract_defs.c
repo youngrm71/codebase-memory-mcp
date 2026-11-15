@@ -727,8 +727,18 @@ static TSNode resolve_js_member_assign_name(TSNode node, CBMLanguage lang) {
     return cbm_js_member_assign_name_node(node);
 }
 
-static TSNode resolve_toplevel_arrow_name(TSNode node, const char *kind) {
-    if (strcmp(kind, "arrow_function") != 0) {
+static TSNode resolve_toplevel_arrow_name(TSNode node, const char *kind, CBMLanguage lang) {
+    const bool is_arrow = strcmp(kind, "arrow_function") == 0;
+    /* D1: an anonymous `function` expression bound by a `const|let|var` declarator
+     * (`let f = function () {}`, `const g = async function () {}`) is named by the
+     * declarator exactly like an arrow. Only the declarator form: a function
+     * expression under a `pair` or class field keeps its previous behaviour. A
+     * named expression (`const f = function g() {}`) never reaches here, its own
+     * `name` field wins earlier. */
+    const bool is_fn_expr =
+        strcmp(kind, "function_expression") == 0 &&
+        (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX);
+    if (!is_arrow && !is_fn_expr) {
         TSNode null_node = {0};
         return null_node;
     }
@@ -738,6 +748,10 @@ static TSNode resolve_toplevel_arrow_name(TSNode node, const char *kind) {
         return null_node;
     }
     const char *pk = ts_node_type(parent);
+    if (is_fn_expr && strcmp(pk, "variable_declarator") != 0) {
+        TSNode null_node = {0};
+        return null_node;
+    }
     if (strcmp(pk, "variable_declarator") == 0 || strcmp(pk, "public_field_definition") == 0) {
         /* `const f = () => {}` and the class-field form `f = () => {}` both name
          * the arrow via the parent's `name` child (#new_ts_class_field_arrow):
@@ -1304,7 +1318,7 @@ TSNode cbm_resolve_func_name(TSNode node, CBMLanguage lang) {
             }
         }
         {
-            TSNode r = resolve_toplevel_arrow_name(node, kind);
+            TSNode r = resolve_toplevel_arrow_name(node, kind, lang);
             if (!ts_node_is_null(r)) {
                 return r;
             }
